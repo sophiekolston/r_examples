@@ -1,0 +1,736 @@
+---
+title: "771 Project"
+author: "Sophie Kolston (skol629)"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Preamble
+# Data requirements: coastline polyline, housing locations and valuations, 
+#     census area units, cliff locations
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE)
+```
+
+## Load packages 
+I use a variety of packages for data manipulation, modelling and visualisation. A key problem I found was constantly switching between different spatial file formats - some functions require spatial dataframes, others require simple features. It's totally manageable as there are functions for converting between, assigning CRS's etc., but it is a bit annoying!
+
+```{r loadpackages}
+# load packages used throughout
+library(readxl)  # parsing xlsx files
+library(tidyverse)  # data manipulation
+library(sf)  # spatial data manipulation (simple features)
+library(tmap)  # mapping
+library(classInt)  # creating class intervals for maps
+library(viridis)  # getting colour blind friendly colour maps
+library(glue)  # string interpolation
+library(gstat)  # spatial statistics
+library(raster)  # raster data manipulation
+library(conflicted)  # managing function reference conflicts
+library(GWmodel)  # GWR analysis
+library(spdep)  # spatial dependence metrics (autocorrelation)
+library(leaflet)  # interactive maps
+library(leaflet.extras2)  # settings for leaflet (side-by-side maps)
+library(basemaps)  # getting basemaps
+
+conflict_prefer('select', 'dplyr')  # prefer select from dplyr (rather than raster)
+conflict_prefer('filter', 'dplyr')  # same for filter
+```
+
+## Load data
+The house sale data I use is proprietary, available only for students of the University of Auckland for research purposes. I imagine using Government Valuation would be reasonably similar, although won't capture market dynamics as well as houses often sale for very different prices to the GV.
+
+IMD data is freely available and open.
+```{r loaddata}
+# set CRS for project. I am using NZTM/EPSG:2193 as it is locally-accurate
+#   and units in. need epsg int and projstring for sf and sp 
+crs <- 2193
+crs_projstring <- '+proj=tmerc +lat_0=0 +lon_0=173 +k=0.9996 +x_0=1600000 +y_0=10000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs'
+
+# prepare bounding box for clipping data
+bbox <- c(1757353.3212, 5921660.2905, 1762371.7687, 5927057.1612)  # copy paste from bbox finder
+dev_bbox <- data.frame(x=c(bbox[1], bbox[3]), y=c(bbox[2], bbox[4]))  # create df from coords
+# convert df to polygon, convert polygon to sf, get bbox as sfc
+# this polygon is the extent of the study area, mainly used for mapping
+dev_extent_poly <- st_as_sfc(st_bbox(st_as_sf(dev_bbox, coords=c('x', 'y'), crs=crs)))
+
+# load house sale data
+sales_data <- read.csv('data/CSTDAT10655_Output1_20220822.csv')  # sale data
+house_ids <- read.csv('data/CSTDAT10655_Output2_20220822.csv')  # house id reference data
+
+# get house ids to clip, rather than sales
+#   this way we can clip the smaller dataset before joining to the larger one, rather than
+#   joining the geometry and then clipping the entire dataset
+# note that this data is in WGS84, I will transform
+housesale_sf <- st_as_sf(house_ids %>% drop_na(c('CL_Longitude', 'CL_Latitude')), coords=c(x='CL_Longitude', y='CL_Latitude'), crs=4326)
+
+# clip houses in devonport using bounding box
+housesale_dev <- st_filter(st_transform(housesale_sf, crs=crs), dev_extent_poly)
+
+# get all georeferenced sales in devonport by joining geometry to sales data
+#   then get most recent sale per property
+dev_sales_geo <- housesale_dev %>%
+  left_join(sales_data, by='CL_QPID') %>%  # CL_QPID = unique id
+  drop_na(CL_Sale_Date) %>%  # drop all that don't have sale date
+  arrange(CL_QPID, desc(CL_Sale_Date)) %>%  # sort by descending sale date
+  group_by(CL_QPID) %>%   # group by id
+  slice(1) %>%  # get first result in each group = most recent sale per property
+  ungroup()  # ungroup
+
+# save only attributes of interest
+sales <- dev_sales_geo %>%
+  select(CL_QPID, CL_Bedrooms, CL_Bathrooms, CL_Sale_Date, CL_Sale_Price_Gross, 
+         CL_Land_Valuation_Capital_Value, CL_Building_Floor_Area, CL_Bldg_Const, 
+         CL_Roof_Const, CL_LUD_Age, CL_LUD_Land_Use_Description, CL_MAS_View, 
+         CL_MAS_House_Type_Description, CL_MAS_Estimated_Year_Built, geometry)
+
+# load IMD data
+dzs <- st_read('data/DataZone2018_GDB/DataZone2018.gdb')  # datazones (spatial unit for imd)
+imd <- read_excel('data/IMD2018.xlsx', sheet=2)  # imd data, second sheet
+
+dzs_clean <- st_make_valid(st_transform(dzs, crs=crs))  # have some invalid geom, have to fix
+
+dzs_dev <- st_intersection(dzs_clean, dev_extent_poly)  # get datazones in devonport
+
+# get all imd data in devonport
+imd_dev_all <- dzs_dev %>% 
+  left_join(imd, by='DZ2018')  # join IMD data to dzs
+
+# save only attributes of interest
+imd_dev <- imd_dev_all %>%
+  select(Census18Pop, Rank_IMD18, Dec_IMD18, Decile_Emp, Decile_Inc, Decile_Cri, 
+         Decile_Hou, Decile_Hea, Decile_Edu, Decile_Acc, Shape)
+
+# load coastline data
+coast <- st_read('data/nz-coastlines-topo-150k.gpkg')  
+
+coast_dev <- st_intersection(coast, dev_extent_poly)  # get coastlines in devonport
+
+# create 'coastal region' polygon
+#   area within a certain distance of coastline to reduce processing time for models
+#   this process is a bit messy - lots of sf/sp changes
+dist_cutoff <- 300  # distance to cutoff by (m away from coastline)
+# get coastline polygon. cast line as polygon, union polygons, make geom valid
+coast_poly <- st_make_valid(st_union(st_cast(coast_dev, 'POLYGON')))
+# disaggregate multiploygons, take the largest polygon
+#   this is to make sure that invalid polygons are not saved
+coast_poly_dev <- st_as_sf(disaggregate(as_Spatial(coast_poly))[4])
+# buffer inverse of the distance cutoff
+inner_poly <- st_buffer(coast_poly_dev, -dist_cutoff)  
+# get difference between coastline polygon and inner polygon, convert to sp
+coast_region_sp <- as_Spatial(st_difference(coast_poly_dev, inner_poly))
+
+# load cliff data
+cliffs_dev <- st_read('data/main_cliff.gpkg')
+```
+
+## Mapping the input data
+
+```{r datamap}
+
+data_map <- tm_shape(coast_poly_dev, unit='m', name='Devonport coastline') +
+  tm_polygons(alpha=0, border.col='blue', border.alpha=1) +
+  tm_shape(imd_dev) +
+  tm_polygons(col='Dec_IMD18', palette='Purples', alpha=0.5, border.alpha=0.2,
+              title='IMD 2018 Decile') +
+  tm_shape(cliffs_dev) +
+  tm_lines(col='brown', lwd=3) +
+  tm_shape(st_as_sf(sales)) +
+  tm_symbols(size=0.01, border.lwd=0.5, col='black') +
+  tm_scale_bar(position='right', breaks=c(0, 500, 1000, 1500)) +
+  tm_compass(position=c(0.95, 0.1), size=0.8) +
+  tm_layout(frame=FALSE, title='Input data in AOI',
+            inner.margins = c(0.02, 0.02, 0.02, 0.35),
+            legend.position=c('right', 'centre'), title.position=c('right', 'top'),
+            legend.text.size=0.8) +
+  tm_add_legend(type='line', col=c('brown', 'blue'), labels=c('Cliff edge', 'Coastline')) +
+  tm_add_legend(type='symbol', col='black', lwd=0, labels='House sale')
+
+
+bbox <- c(1745240.5902,5917150.2975,1768513.4184,5934662.2828)
+lg_bbox <- data.frame(x=c(bbox[1], bbox[3]), y=c(bbox[2], bbox[4]))
+dev_reg_poly <- st_as_sfc(st_bbox(st_as_sf(lg_bbox, coords=c('x', 'y'), crs=crs)))
+set_defaults(map_service='osm', map_type='streets')
+basemap <- basemap_raster(dev_reg_poly)
+
+region_map <- tm_shape(basemap, unit='km') +
+  tm_rgb(alpha=0.8) +
+  tm_shape(coast_poly_dev) +
+  tm_polygons(col='gray', alpha=0.5, lwd=2) +
+  tm_scale_bar(position='right', breaks=c(0, 2, 4, 6)) +
+  tm_compass(position=c(0.95, 0.1), size=1.1) +
+  tm_layout(frame=FALSE, title='Auckland with Devonport AOI',
+            legend.position=c('left', 'bottom'), title.position=c('left', 'top'),
+            legend.text.size=0.8) +
+  tm_add_legend(type='fill', labels='Devonport AOI', col='gray')
+  
+background_maps <- tmap_arrange(region_map, data_map, nrow=1)
+
+tmap_save(background_maps, 'output/background_maps.png', dpi=400, width=13, height=6)
+```
+
+## Mapping the dependent variable
+
+```{r mapsaleprice}
+# get devonport polygon from imd
+#   this is land polygon, essentially the same as the original coastline polygon
+#   different enough to warrant creating a new one though. has all valid geoms 
+dev_land_poly <- st_union(imd_dev)
+
+# create breaks for price values. manual so I can do quantiles on point data,
+#   which you can't do natively on tmap. round values
+price_breaks <- round(classIntervals(sales$CL_Sale_Price_Gross, 
+                                     n=6, style='quantile')$brks, digits=0)
+
+# function for getting map labels (eg. x to y, with comma demarcations)
+get_map_labels <- function(breaks) {
+  custom_labels = c()  # save in vector
+  for (x in 1:length(breaks)) {  # for each break
+    if (x == length(breaks)) {  # if last break
+      # end the breaks in 'to x'
+      cur_break <- formatC(breaks[x - 1], format='d', big.mark=',')
+      custom_labels <- append(custom_labels, (glue('over {cur_break}')))
+      
+    } else if (x == 2) {  # if first break
+      # start breaks with 'under x'
+      cur_break <- formatC(breaks[x], format='d', big.mark=',')
+      custom_labels <- append(custom_labels, (glue('under {cur_break}')))
+      
+    } else {  # if any other break
+      # use 'x to x+1'
+      break_1 <- formatC(breaks[x - 1], format='d', big.mark=',')
+      break_2 <- formatC(breaks[x], format='d', big.mark=',')
+      custom_labels <- append(custom_labels, (glue('{break_1} to {break_2}')))
+    }
+  }
+  
+  return(custom_labels)  # return labels
+}
+
+
+# function for getting devonport 'basemap'
+#   I make a lot of maps of the area so this is easier, keeps things consistent
+get_dev_map <- function(dev_land_polygon=dev_land_poly) {
+  
+  # create map object
+  # map is land polygon (only outline), scale bar, north arrow, some formatting
+  devonport_map <- tm_shape(dev_land_polygon, unit='m', name='Devonport polygon') +
+    tm_polygons(alpha=0) +
+    tm_scale_bar(position='right', breaks=c(500, 1000, 1500)) +
+    tm_compass(position=c(0.95, 0.1), size=0.8) +
+    tm_layout(frame=FALSE, 
+              inner.margins = c(0.02, 0.02, 0.02, 0.35),
+              legend.position=c('right', 'centre'), title.position=c('right', 'top'),
+              legend.text.size=0.8)
+  
+  return(devonport_map)  # return map object
+}
+
+
+# function for rasterizing (through IDW) input point data
+#   for GWR output this is needed such that a continuous surface is created
+#   rather than sole prediction at each point
+rasterize_variable <- function(data, variable, extent_poly=dev_extent_poly,
+                               mask_poly=coast_region_sp,
+                               spatial_res=100, crs=crs_projstring) {
+  bbox_vals <- st_bbox(extent_poly)  # get bbox of extent
+  
+  # create grid within bbox, by a given spatial resolution
+  #   grid is the points to IDW interpolate to
+  grid <- expand.grid(x=seq(from=bbox_vals$xmin, to=bbox_vals$xmax, 
+                            by=spatial_res),
+                      y=seq(from=bbox_vals$ymin, to=bbox_vals$ymax,
+                            by=spatial_res))
+  
+  # convert grid to sf
+  grid_sf <- st_as_sf(grid, coords=c('x', 'y'), crs=crs)
+  
+  # define IDW formula and make predicts
+  #   this needs to be used over the gstat IDW function as that does not 
+  #   allow for variable eval in the input - basically meaning you can't pass
+  #   through variables to a function to evaluate. This formula var~1 is IDW
+  gs <- gstat(formula=as.formula(paste(variable, '~1')), data=data)  # get formula
+  preds <- predict(gs, newdata=grid_sf, debug.level=0)$var1.pred  # make predictions to grid
+  
+  # save IDW output to df
+  idw_df <- as.data.frame(grid)
+  idw_df$preds <- preds
+  
+  # create raster from df, mask raster to input, then save CRS
+  idw_rast <- rasterFromXYZ(idw_df)
+  idw_rast_masked <- mask(idw_rast, st_as_sf(mask_poly))
+  crs(idw_rast_masked) <- crs_projstring
+  
+  return(idw_rast_masked)  # return masked IDW raster
+}
+
+
+# make map of sale price points
+map_price <- get_dev_map() +
+  tm_shape(st_as_sf(sales), unit='m', name='House sales') +
+  tm_dots(col='CL_Sale_Price_Gross', breaks=price_breaks, palette='cividis', 
+            size=0.01, legend.show=FALSE, id='CL_QPID',
+            popup.vars=c('Sale price ($): '='CL_Sale_Price_Gross')) +
+  tm_add_legend(type='symbol', col=cividis(n=6), 
+              labels=get_map_labels(price_breaks), title='Gross sale price ($)') +
+  tm_layout(title='Most recent house sales\nin Devonport (raw data)')
+
+# rasterize price data
+# the rasterize function does not change much in terms of parameters, so I will
+#   comment on it here but not onward
+price_rast <- rasterize_variable(data=st_as_sf(sales),  # input data
+                                 variable='CL_Sale_Price_Gross',  # variable to interpolate
+                                 extent_poly=dev_extent_poly,  # extent to grid to
+                                 spatial_res=10)  # spatial resolution of raster
+
+# map of sale price surface
+map_price_surface <- get_dev_map() + 
+  tm_shape(price_rast) +
+  tm_raster(style='fixed', breaks=price_breaks, title='Gross sale price ($)',
+            palette='cividis') +
+  tm_layout(title='Most recent house sales\nin Devonport (rasterized)')
+
+# arrange and save maps
+raw_pricemaps <- tmap_arrange(map_price, map_price_surface, ncol=2)
+tmap_save(raw_pricemaps, 'output/raw_pricemaps.png', dpi=400, width=13, height=6)
+
+raw_pricemaps  # display maps
+
+tmap_leaflet(map_price)  # display interactive version of raw price map
+```
+
+## Merging the data, cleaning dummy variables
+
+```{r mergedata}
+# add distance to coastline to data
+# dist of each sale to coast line. convert to int from unit int (we know the unit)
+sales$distToCoast <- as.matrix(as.integer(st_distance(sales, coast_dev)))  
+sales <- sales %>% filter(distToCoast < dist_cutoff)
+
+cliff_dist <- 60  # distance defined as within cliff-top
+
+# add in/out of clifftop area
+# buffer cliffs by a certain distance, cast as multipolygon then combine to 1 feature
+clifftop_area <- st_combine(st_cast(
+  st_buffer(cliffs_dev, dist=cliff_dist, endCapStyle='SQUARE'), 'MULTIPOLYGON'))
+sales$nearClifftop <- as.matrix(st_within(sales, clifftop_area))  # check if sales are within the clifftop area
+sales$nearClifftop <- as.integer(sales$nearClifftop)  # convert to int for GWR (rather than boolean)
+
+# add imd data to sales
+sales_imd <- st_join(sales, imd_dev)  
+
+# IMD is categorical, so create boolean values here - convert to dummy variables
+high_cutoff <- 3  # decile is 1 - 10, but dep is so low in dev that this makes sense
+sales_imd_decategorized <- sales_imd %>%
+  mutate(high_emp=case_when(Decile_Emp > high_cutoff ~ 1, .default=0),
+         high_inc=case_when(Decile_Inc > high_cutoff ~ 1, .default=0),
+         high_cri=case_when(Decile_Cri > high_cutoff ~ 1, .default=0),
+         high_hou=case_when(Decile_Hou > high_cutoff ~ 1, .default=0),
+         high_hea=case_when(Decile_Hea > high_cutoff ~ 1, .default=0),
+         high_edu=case_when(Decile_Edu > high_cutoff ~ 1, .default=0),
+         high_acc=case_when(Decile_Acc > high_cutoff ~ 1, .default=0),
+         high_dec=case_when(Dec_IMD18 > high_cutoff ~ 1, .default=0))
+         #dec_1to2=case_when(Dec_IMD18 %in% c(1, 2) ~ 1, .default=0),
+         #dec_3to4=case_when(Dec_IMD18 %in% c(3, 4) ~ 1, .default=0),
+         #dec_5plus=case_when(Dec_IMD18 > 4 ~ 1, .default=0))
+
+
+# define dependent variable
+dep_var <- 'CL_Sale_Price_Gross'
+
+# define independent variables
+ind_vars <- c('CL_Bedrooms', 'CL_Bathrooms', 'CL_Building_Floor_Area',
+              'distToCoast', 'nearClifftop', 'high_emp', 'high_inc',
+              'high_cri', 'high_hou', 'high_hea', 'high_edu',
+              'high_acc', 'high_dec')
+
+# called clean as this is the final version of the data
+sales_clean <- as.data.frame(sales_imd_decategorized) %>% 
+  # keep logged sale price in case I want it later
+  #   I found my results were better with raw sale price, plus makes mapping easier
+  mutate(log_saleprice=log(CL_Sale_Price_Gross)) %>%  
+  select('CL_QPID', ind_vars, dep_var, 'geometry', 'log_saleprice') %>%  # select vars of interest
+  drop_na(ind_vars, dep_var) %>%  # drop rows that don't have important vars
+  mutate(across(-c('geometry', 'log_saleprice'), as.integer))  # convert certain cols to integer (save memory)
+
+sales_clean_sf <- st_as_sf(sales_clean)  # save as sf
+sales_clean_sp <- as_Spatial(sales_clean_sf)  # spatial dataframe (sp) for gwr tools
+
+head(sales_clean)  # show head to explore data structure
+```
+
+## Build global model
+
+```{r buildglobal model}
+# save as 'data' to make it easier to reference/keep consistent spatial format
+data <- as_Spatial(st_as_sf(sales_clean))
+
+# if model has been run before, I will save the text here to save processing 
+#   time while debugging
+#best_model_fm <- as.formula('CL_Sale_Price_Gross ~ CL_Building_Floor_Area + 
+#    distToCoast + CL_Bathrooms + nearClifftop + CL_Bedrooms + high_cri + high_acc + 
+#    high_hea')
+
+best_model_fm <- NULL
+
+# this checks if the formula has been calculated in previous code runs 
+#   by checking the above variable. the optimization processes takes about 
+#   30 minutes on my computer so this makes debugging easier
+if (is.null(best_model_fm)) {
+  # get formula from ind and dep variables
+  full_model_fm <- as.formula(paste(dep_var, '~', paste(ind_vars, collapse='+')))
+  
+  # find optimal bandwidth, using AICc. model will use gaussian kernel
+  full_optimal_bw <- bw.gwr(full_model_fm, data=data, approach='AICc',
+                       kernel='gaussian', adaptive=TRUE)
+  
+  # find models using full formula (splitting off variables and test for AICc)
+  full_model_sel <- model.selection.gwr(dep_var, ind_vars, data=data,
+                                        kernel='gaussian', adaptive=TRUE,
+                                        bw=full_optimal_bw)
+  
+  # sort models (by AICc)
+  sorted_models <- model.sort.gwr(full_model_sel, length(ind_vars),
+                                  ruler.vector=full_model_sel[[2]][,2])
+  model_list <- sorted_models[[1]]  # get list of models
+  
+  # plot model addition of variables/stops
+  model.view.gwr(dep_var, ind_vars, model.list=model_list)
+  
+  AICc_list <- sorted_models[[2]][,2]  # get list of AICc values
+  
+  indices <- rep(length(ind_vars), length(ind_vars))  # get indices of models
+  
+  # find the index of each 'step change' - where a variable was added
+  # for each position/index, take the number from previous step (i-1) and add (n-i)
+  #    then correct by adding another 1, because I started at i=2
+  for (i in 2:length(ind_vars)) {
+    indices[i] = indices[i - 1] + ((length(ind_vars) - i) + 1)
+  }
+  
+  AICc_bestmodelvals <- AICc_list[indices]  # find AICc values for models at these indices
+  
+  # calculate difference of AICc between models
+  AICc_dif <- AICc_bestmodelvals[1:(length(ind_vars) - 1)
+                  ] - AICc_bestmodelvals[2:length(ind_vars)]
+  AICc_dif <- c(0, AICc_dif)
+  
+  AICc_bestmodelvals
+  
+  # choose model based on AICc change
+  
+  # find the second (first is 0, intercept) AICc dif value that is less
+  #   than 2. Then minus one to take the value before this
+  best_index <- which(AICc_dif < 3)[2] - 1
+  
+  best_model <- model_list[indices][best_index][[1]][[1]]  # get best model
+  best_model_fm <- as.formula(best_model)  # get formula of best models
+}
+
+best_model_fm  # print formula for chosen model
+
+global_model <- lm(best_model_fm, data=data)  # calculate global model
+
+summary(global_model)  # print summary of global model
+```
+
+## Make predictions with global model
+
+```{r globalmodel_predictions}
+# construct weighted model from global model output
+#   this is based on the global model such that you do not have to add coefficients
+#   manually, which is pretty cool for testing sensitivity etc. if you want
+form_ind_vars <- all.vars(best_model_fm)[-1]  # get all variables (except 1st=ind)
+gl_ind_coefs <- global_model$coefficients[-1]  # get all coefficients (except 1st=ind)
+# constructed weighted global model
+#   use first coefficient, then paste all others obtained above
+gl_fm_weighted <- paste(global_model$coefficients[1], '+', paste(form_ind_vars, '*', gl_ind_coefs, collapse=' + '))
+# predict dependent variable using the model above
+data <- transform(data, glmod_saleprice=eval(parse(text=gl_fm_weighted)))
+
+# calculate residuals
+data$glres <- data$CL_Sale_Price_Gross - data$glmod_saleprice  # global residuals
+data$stglres <- (data$glres - mean(data$glres)) / sd(data$glres)  # standardised global residuals
+
+# convert to spatial. transform function converts to dataframe so need to convert back
+data <- as_Spatial(st_as_sf(data, coords=c('coords.x1', 'coords.x2'), crs=crs))
+
+# rasterize residuals and predictions for mapping
+stglres_rast <- rasterize_variable(data, 'stglres', spatial_res=10)
+glpreds_rast <- rasterize_variable(data, 'glmod_saleprice', spatial_res=10)
+
+# define breaks using statistical significance cutoffs (99%=2.58, 95%=1.96)
+breaks_stglres <- c(min(data$stglres), -2.58, -1.96, 0, 1.96, 2.58, max(data$stglres))
+
+# my custom version of the colour blind friendly brbg palette, this time with
+#   a bit less white since most of the map is the middle colour. still friendly!
+brbg_better <- c('#8c510a', '#d8b365', '#f6e8c3', '#c7eae5', '#5ab4ac', '#01665e')
+
+# map of standardised global residuals
+map_stglres <- get_dev_map() + 
+  tm_shape(stglres_rast) +  
+  # use breaks and palette created above
+  tm_raster(style='fixed', breaks=breaks_stglres, palette=brbg_better, 
+            title='Standardised global residuals') +
+  tm_layout(title='Global Model Residuals')
+
+# map of global predictions
+map_glpreds <- get_dev_map() +
+  tm_shape(glpreds_rast) +
+  # use same breaks as other price maps (created previously)
+  tm_raster(style='fixed', breaks=price_breaks, palette='cividis',
+            title='Predicted gross sale price ($)') +
+  tm_layout(title='Global Model Predictions')
+```
+
+## Build local model
+
+```{r buildlocalmodel}
+# calculate local model bandwidth
+# if already calculated (save in variable), do not re-calculate
+#lc_optimal_bw <- 164  
+lc_optimal_bw <- NULL
+if (is.null(lc_optimal_bw)) {
+  lc_optimal_bw <- bw.gwr(best_model_fm, data=data, approach='AICc', 
+                          kernel='gaussian', adaptive=TRUE)  
+}
+
+# run the GWR model
+gwrmodel <- gwr.basic(best_model_fm, data=data, bw=lc_optimal_bw, 
+                      kernel='gaussian', adaptive=TRUE) 
+
+gwrmodel  # print summary of GWmodel
+
+# save model output in dataframe
+mapGWR <- cbind(data, as.matrix(as.data.frame(gwrmodel$SDF)))  # join results to the original data
+
+# rename parameter estimates columns to something more readable
+#   previously suffixed with ..0.1, now _beta
+names(mapGWR) <- sub("\\.1$", "_beta", names(mapGWR))
+```
+
+## Map local and global residuals and predictions
+
+```{r global_local}
+# rasterize local residuals
+stlcres_rast <- rasterize_variable(mapGWR, 'Stud_residual', spatial_res=10)
+
+# define breaks for local residual using same statistical significance cutoffs
+breaks_stlcres <- c(min(mapGWR$Stud_residual), -2.58, -1.96, 0, 1.96, 2.58,
+                    max(mapGWR$Stud_residual))
+
+# map of local residuals
+map_stlcres <- get_dev_map() + 
+  tm_shape(stlcres_rast) +
+  # use breaks created above, same palette as used for global map
+  tm_raster(style='fixed', breaks=breaks_stlcres, palette=brbg_better, 
+            title='Standardised local residuals') +
+  tm_layout(title='Local Model Residuals')
+
+# plot and save local and global residuals together
+res_comp <- tmap_arrange(map_stglres, map_stlcres, nrow=1, asp=1)
+tmap_save(res_comp, 'output/residual_comparison.png', dpi=400, width=13, 
+          height=6)
+
+# rasterize predictions
+lcpreds_rast <- rasterize_variable(mapGWR, 'yhat', spatial_res=10)
+
+# map of local predicions
+map_lcpreds <- get_dev_map() +
+  tm_shape(lcpreds_rast) +
+  # use same breaks as global price/raw data price vals
+  tm_raster(style='fixed', breaks=price_breaks, palette='cividis',
+            title='Predicted gross sale price ($)') +
+  tm_layout(title='Local Model Predictions')
+
+# plot and save local and global predictions together
+pred_comp <- tmap_arrange(map_glpreds, map_lcpreds, nrow=1, asp=1)
+tmap_save(pred_comp, 'output/prediction_comparison.png', dpi=400, width=13,
+          height=6)
+
+# show plots
+res_comp
+pred_comp
+```
+
+## Create local significance maps
+
+```{r significancemaps}
+res <- 10  # useful for debugging vs final output (processing time)
+
+# function for creating statistic significance surface
+#   gets significant t values, uses this as a mask for rasterized beta values
+#   result is a surface of statistically significant areas and the beta values
+#   within. default value assumes 95% is significant (1.96)
+get_sigrast <- function(data, variable_name, sig_val=1.96, spatial_res=res) {
+  
+  # rasterize t values. get variable name from variable string and '_TV' suffix
+  tv_rast <- rasterize_variable(data, paste(variable_name, '_TV', sep=''), 
+                                spatial_res=spatial_res) 
+  
+  # convert t value raster to polygons, where polygons are created if raster
+  #   values are greater than significance value. dissolve polygons
+  tv_polys <- rasterToPolygons(tv_rast, fun=function(x){x > sig_val},
+                               dissolve=TRUE)
+  
+  # return null if no polygons were created (if there are no statistically
+  #   significant areas in the map)
+  if (is.null(tv_polys)) {
+    return(NULL)
+  }
+  
+  # rasterize beta values. get variable name from variable string and '_beta' suffix
+  b_rast <- rasterize_variable(data, paste(variable_name, '_beta', sep=''),
+                               spatial_res=spatial_res)
+  
+  # mask beta raster with t value polygons
+  sig_rast <- mask(b_rast, tv_polys)
+  
+  return(sig_rast)  # return masked beta raster
+}
+
+# create raster and map for each variable in model
+# for each variable in independent variable list (from model)
+for (var in form_ind_vars) {
+  index <- which(form_ind_vars == var)  # get the index of the variable
+  
+  rast <- get_sigrast(mapGWR, var)  # rasterize the variable
+  
+  if (!is.null(rast)) {  # if the raster has data
+    # modify the amount breaks are rounded by based on the maximum value of the raster
+    if (max(getValues(rast), na.rm=TRUE) < 100000) {
+      modifier <- -2  # round to nearest 100
+    } else {
+      modifier <- -4  # round to nearest 10,000
+    }
+    # create breaks for raster classification
+    #   quantile seems to look the best/make the most sense. I could go with pretty
+    #   but I like consistent class sizes
+    rast_breaks <- round(classIntervals(getValues(rast), style='quantile', n=6)$brks, modifier)
+
+    # create map of the raster. set common elemnets like legend title, NA colour
+    map <- get_dev_map() +
+      tm_shape(rast) +
+      tm_raster(palette='cividis', textNA='Non-significant', colorNA='white',
+                title='Price difference ($)', style='fixed', breaks=rast_breaks) + 
+      tm_shape(dev_land_poly) +  # background polygon (goes 'below' raster)
+      tm_polygons(alpha=0)
+  
+    if (index == 1) {  # if this is the first ind variable
+      # create lists. add raster and map to the lists
+      all_rasts <- list(rast)
+      all_maps <- list(list(map))  # have to cast as list otherwise it will unpack map as list
+    } else {  # if this is any other variable
+      # append to previously created lists
+      all_rasts <- append(all_rasts, rast)
+      all_maps <- append(all_maps, list(map))
+    }
+  } else {  # if the raster has no data
+    # append string signifying null data to the lists
+    all_rasts <- append(all_rasts, 'no data')
+    all_maps <- append(all_maps, 'no data')
+  }
+}
+# set the names of the lists to be the appropriate variable, so they can be 
+#   easily referenced
+all_rasts <- set_names(all_rasts, form_ind_vars)
+all_maps <- set_names(all_maps, form_ind_vars)
+
+# create significance maps. these are the only variables I think are worth 
+#   mapping, but feel free to explore your own
+leg_scale <- 1  # useful when exporting maps, can change scale of all at once
+
+# map of floor area
+map_sig_floor <- all_maps$CL_Building_Floor_Area[[1]] +  # silly but not worth fixing
+  tm_layout(title='Effect of floor area\non predicted house prices',
+            legend.width=leg_scale, panel.label.size=leg_scale, 
+            panel.label.height=leg_scale, legend.height=leg_scale)
+
+# map of near clifftop or not
+map_sig_cliff <- all_maps$nearClifftop +
+  tm_layout(title='Effect of being near a cliff-top on\npredicted house prices',
+            legend.width=leg_scale, panel.label.size=leg_scale, 
+            panel.label.height=leg_scale, legend.height=leg_scale)
+
+# map of bathrooms
+map_sig_bath <- all_maps$CL_Bathrooms +
+  tm_layout(title='Effect of number of bathrooms on\npredicted house prices',
+            legend.width=leg_scale, panel.label.size=leg_scale, 
+            panel.label.height=leg_scale, legend.height=leg_scale)
+
+# map of access
+map_sig_acc <- all_maps$high_acc +
+  tm_layout(title='Effect of high deprivation of access to\nservices on predicted house prices', 
+            legend.width=leg_scale, panel.label.size=leg_scale, 
+            panel.label.height=leg_scale, legend.height=leg_scale) 
+
+# plot and save all variable maps together
+sig_maps <- tmap_arrange(map_sig_floor, map_sig_cliff, map_sig_bath, map_sig_acc,
+             ncol=2)
+if (res <= 10) {  # basically this just means only save when NOT debugging (lower res)
+  tmap_save(sig_maps, 'output/parameter_ests.png', dpi=400, width=13, height=10)
+}
+
+sig_maps  # show all
+```
+
+## Map local r-squared
+
+```{r}
+# define breaks of r2, rounding numbers
+r2_breaks <- round(classIntervals(mapGWR$Local_R2, n=6, style='equal')$brks, digits=2)
+
+# map of local r2
+map_lcr2 <- get_dev_map() +
+  # rasterize r2 inline since im not using it anywhere else
+  tm_shape(rasterize_variable(mapGWR, 'Local_R2', spatial_res=res)) +
+  # use breaks created above
+  tm_raster(style='fixed', breaks=r2_breaks, palette='cividis', 
+            title='r\u00b2') +
+  tm_layout('Local model r\u00b2')  # unicode character definition (r superscript)
+
+tmap_save(map_lcr2, 'output/localr2.png', width=8, height=6)
+map_lcr2
+
+# spatial autocorrelation of residuals
+knn <- knearneigh(coordinates(data), longlat=FALSE)  # get nearest neighbours of points
+knn_neighbours <- knn2nb(knn)  # convert to nearest neighbours object to neighbours list
+listw <- nb2listw(knn_neighbours, style='W')  # convert list to spatial weights object
+
+# perform morans test, note that global and local models have the same geometry
+gl_moran <- moran.test(data$stglres, listw)  # global morans test on global model
+gl_moran_zval <- as.double(sqrt(gl_moran$p) / gl_moran$statistic)  # get z val
+
+lc_moran <- moran.test(mapGWR$Stud_residual, listw)  # global morans test on local model
+lc_moran_zval <- as.double(sqrt(lc_moran$p) / lc_moran$statistic)  # get z val
+
+gl_moran
+gl_moran_zval
+
+lc_moran
+lc_moran_zval
+```
+
+## Interactive map of predictions
+
+The leaflet function uses shiny which won't work on HTML output, so run the code to make this work.
+
+```{r}
+# leaflet function instead of tmap as this offers more customization (side-by-side)
+interactive_pred_map <- leaflet(width='100%') %>%
+  # add left and right map panes
+  addMapPane('right', zIndex=0) %>%  
+  addMapPane('left',  zIndex=0) %>%
+  # add basemap tiles to left and right panes
+  addTiles(group='base', layerId='base_left', options=pathOptions(pane='left')) %>% 
+  addTiles(group='base', layerId='base_right', options=pathOptions(pane='right')) %>% 
+  # add global and local predictions rasters
+  addRasterImage(x=glpreds_rast, options=leafletOptions(pane='right'), group='global') %>% 
+  addRasterImage(x=lcpreds_rast, options=leafletOptions(pane='left'), group='local') %>%
+  # add overlay/swipe controls
+  addLayersControl(overlayGroups=c('local', 'global')) %>%
+  addSidebyside(layerId='sidecontrols', rightId='base_left', leftId='base_right')
+
+interactive_pred_map  # show
+```

@@ -1,0 +1,692 @@
+---
+title: "Exploring Climate Indicators in R"
+author: "Sophie Kolston (skol629)"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Preamble
+# Data requirements: co2 concentration, sea surface temperature (described in markdown)
+
+<!-- change font size of markdown text -->
+<style type="text/css">
+  body{
+  font-size: 12pt;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE) # ignore warnings and messages when knitting
+```
+
+## Introduction
+Anthropogenic cimate change is a global issue that has and will continue to cause irreversible damage to a significant proportion of the global population (Masson-Delmotte et al., 2021; Pörtner et al., 2022). We need to monitor how humans are influencing the climate such that we can adjust our behaviour to mitigate the worst effects of a changing climate. Greenhouse gas emissions and indicators of climate are important as they can measure our direct influence on the climate system (Fawzy et al., 2020). In this report I will explore an emissions variable and an indicator variable, showing how open-source tools and data can be used by anyone to make a simple assessment of a changing climate.
+ 
+When looking at the causes of anthropogenic climate change we often look at carbon dioxide (CO$_2$) emissions. It's difficult to measure at the source, but luckily we have long-term time series of CO$_2$ so we can explore the relationship it has on climate conditions. But how do we measure climate conditions? A key player in the climate system is the ocean, which has a huge impact of heat distribution and transmission globally. Heat distribution leads to weather, the extremes of which are a good barometer of climate change. So the temperature of the ocean, particularly the surface which leads to winds and localised weather, can be a good (but not complete!) measure of climate conditions. This measure is called Sea Surface Temperature (SST) and is a common feature of climate models.
+
+I want to look at the relationship between SST and CO$_2$, as well as looking at how these variables vary over space and time. This may give an indication of how anthropogenic climate change correlates to more extreme weather, using CO$_2$ concentration and SST as our representatives.
+
+I will be exploring the following questions:
+
+* How has SST varied over space and time?
+* How has CO$_2$ varied over time?
+* Do these variables exhibit seasonal variation?
+* What is the relationship between CO$_2$ and SST?
+
+I will explore these by manipulating and visualising the data in various formats. I'll start with SST, then move to CO$_2$, then combine the data and explore them together. All of my code will be presented so you can complete, critique, and build upon the analyses yourself!
+
+## Prerequisities
+If you have downloaded the markdown file and want to run this yourself, make sure you download the data (placed in a folder named 'data' in the directory of the markdown folder). You will also need to install all of the packages I use (see Setting Up). Note that a couple of the visualisations take a while to render, especially the SST animation which also takes up a ~150mb of storage (although you can delete the frames as soon as you have rendered the video).
+
+## Data
+As I mentioned before, we have long-term time series of CO$_2$ data. I will use the Mauna Loa open dataset, which goes back to the mid 1950s and measures CO$_2$ concentration at a station in Hawaii. The data are maintained by the [National Oceanic and Atmospheric Administration](https://www.noaa.gov/). You can find the dataset at the [Global Monitoring Laboratory of NOAA](https://gml.noaa.gov/ccgg/about/co2_measurements.html), which is open and accessible with attribution (Keeling et al., 2001).
+
+Measuring SST is difficult as it requires vessel expeditions. These days you can measure from space with satellites, but these time series only go back to when satellites were first launched in the ~1980s. If we want to go further back we need models. I will be using the 
+The Extended Reconstructed Sea Surface Temperature (ERSST) model data. ERSST data are derived from a set of marine/ocean observations, then modelled alongside other climate variables. The data are monthly averages, ranging from 1854 to 2020. You can find the dataset on the [NOAA gridded data site](https://psl.noaa.gov/data/gridded/data.noaa.ersst.v5.html). This dataset is also open and accessible (Huang et al., 2017).
+
+## Setting up
+First let's load up all the packages needed for the analyses. I will also set the working directory - if you have downloaded the zip file it should work automatically, setting the working directory to be the location of the folder. 
+```{r 0_envsetup}
+# load packages to use throughout
+library(this.path)  # easy obtaining of source file dir/path
+library(ggplot2)  # plotting
+library(ncdf4)  # netcdf parsing 
+library(raster)  # raster analysis
+library(tidyverse)  # data manipulation
+library(lubridate)  # date manipulation
+library(tmap)  # mapping
+library(av)  # video file creation
+library(sf)  # spatial feature manipulation
+library(scales)  # useful for setting labels/removing sci notation
+library(latex2exp)  # latex rendering for equations/labels
+library(ggfortify)  # plotting and exploring models
+library(plotly)  # interactive plotting
+
+# set working directory to that of this rmd file
+#   this is assuming zip file with contents were not modified, such that the /data/ relative path will work
+setwd(this.path::here())  
+
+# create directories for plots
+#   these will not crash, only warn if the directories already exist, so 
+#   no need to check if folders exist already
+dir.create('vis_frames/')
+dir.create('plots/')
+```
+
+## Loading and exploring the datasets individually
+
+### Sea surface temperature
+There are a few options to load up NetCDF data, which is what the SST data are saved as. First I will use the ncdf4 library to load it up and look at the metadata. 
+
+```{r 1_loadsstnc}
+# load sea surface temperature data with ncdf4 library
+sst <- nc_open('data/sst.mnmean.v3.nc')
+
+sst  # print data info
+```
+
+We can see a lot of information here! We have 2 variables - time range (time_bnds) and SST. The SST contains latitude (lat) and longitude (lon) and time. Latitude and longitude are our y and x values respectively, so we can make maps. These are recorded at 2$^\circ$ precision. Time is in the unit of days since 01/01/1800... we will probably have to convert this. Other than that we have lots of other information about the data under global attributes. 
+
+Next I will load up the data as a stack of spatial rasters so we can map everything.
+
+```{r 2_loadsstrast}
+# load sst data as raster stack
+sst_rast <- stack('data/sst.mnmean.v3.nc')
+
+sst_rast  # print data info
+```
+
+We can see the raster stack has the same amount of layers as the size of time (1994), indicating that there is a raster for each point of time data. The names confirm this, with each layer having a date as the name (it looks like the raster library has parsed the date into a format we can read easily, so the conversion will be straightforward). The coordinate reference system is [WGS84](https://www.linz.govt.nz/guidance/geodetic-system/coordinate-systems-used-new-zealand/geodetic-datums/world-geodetic-system-1984-wgs84), which you can guess from the range of coordinate values when we first opened the data.
+
+First let's take a look at the underlying geometry to see how the raster is laid out.
+
+```{r 3_visrastgeom}
+# convert raster stack to points
+#   each point is an xy - a cell of the raster, along with the associated data 
+#   that we found with the previous nc open (time, sst)
+sst_df <- data.frame(rasterToPoints(sst_rast))
+
+# plot geometry
+sst_geom <- sst_df %>% select(c(x, y))  # extract geometry from df
+# convert to simple feature. use WGS84 (epsg:4326) as that was the CRS listed in the raster stack
+sst_geom_sf <- st_as_sf(sst_geom, coords=c('x', 'y'), crs=4326)
+
+# note here that I am not going to save plots as variables except where necessary
+#   this code already saves a fair bit in memory so I want to reduce this where I
+#   can. the plots will show in markdown, and if you want to save them as image
+#   files you can modify the code
+
+# make map of raster stack geometry
+tm_shape(sst_geom_sf) +
+  tm_dots(size=0.001, col='red', title='Data point') +  # point data
+  # set title, size, position. make north arrow and scale appear outside of the map
+  tm_layout(main.title='SST data points',
+            main.title.size=1,
+            main.title.position='center',
+            frame=FALSE,
+            attr.outside=TRUE) +
+  tm_scale_bar(position=c('left', 'top'), breaks=c(0, 2500, 5000, 7500, 10000)) +  # add scale bar at set breaks (km)
+  tm_compass(size=1, position=c('right', 'top')) +  # add north arrow
+  tm_grid() +  # add x/y reference grid
+  tm_xlab('Longitude') +  # set x label  (longitude)
+  tm_ylab('Latitude') +  # set y label (latitude)
+  tm_add_legend(type='symbol', label='Data point', col='red') +  # add legend
+  tm_legend(position=c(0.6, -0.3))   # change legend position
+```
+
+Looks like the raster is a grid with no values on land - makes sense as the data are ocean-based. What about the underlying raster values?
+
+I am going to convert the data into long format and add some more information that will be helpful when picking out trends, like climate zone (eg. antarctic, tropical, etc.).
+
+```{r 4_sstdata}
+# create long version of SST data
+#   this will have rows for each x, y, date and variable
+#   I will also classify the climate zone of each point based on lat/lon
+sst_df_long <- sst_df %>%
+  # move SST to long, retain x and y, name by date
+  pivot_longer(cols=-c('x', 'y'), names_to='date', values_to='sst') %>%  
+  # format dates. We will use different dates for plotting throughout
+  #   I am using lubridate to change date formats, get month and year etc.
+  mutate(date_day=as_date(date, format='X%Y.%m.%d'), date_month=format(date_day, '%Y-%m')) %>%
+  mutate(year=year(date_day), month=month(date_day), 
+         # define hemispheres
+         # assumption: that values of exactly 0 deg lat are in southern hemisphere
+         #    and values of exactly 180 deg lon are eastern hempishere
+         lat_hem=case_when(y > 0 ~ 'northern', y <= 0 ~ 'southern'),
+         lon_hem=case_when(x < 180 ~ 'western', x >= 180 ~ 'eastern'),
+         # define tropical/subtropical climates
+         zone=case_when((y > 23 & y <= 66) ~ 'northern temperate zone',
+                        (y > 66) ~ 'arctic',
+                        (y <= 23 & y >= -23) ~ 'tropical',
+                        (y < -23 & y >= -66) ~ 'southern temperate zone',
+                        (y < -66) ~ 'antarctic')) %>%
+  select(-date)  # remove original date
+
+head(sst_df_long)  # print the start of the long data to show structure
+
+range(sst_df_long$date_day)  # print date range
+
+# plot distribution of values
+ggplot(sst_df_long, aes(x=sst)) +  # dist of sst
+  geom_histogram() +  # histogram plot
+  theme_bw() +  # set theme
+  # set labels
+  labs(x='SST (\u00B0C)', y='Count of data points', title='Distribution of all SST values') +
+  scale_y_continuous(labels=label_comma()) +  # format number to have commas, not sci notation
+  scale_x_continuous() +  # set x axis to continuous
+  theme(plot.title=element_text(hjust=0.5))  # centre plot title 
+```
+
+The distribution is heavily skewed towards the lower and higher ends. The data ranges from the start of 1854 to the start of 2020. Now let's try and visualise SST using the raster stack. We know the rasters are stacked by time, so I will take a couple of rasters based on this attribute to map SST at 2 time periods
+
+```{r 5_sstmaps}
+# I have defined these breaks after looking at the distribution of values
+#   these should present the data well
+sst_val_brks <- c(-5, 0, 5, 10, 15, 20, 25, 30, 35)
+
+# function for producing sst maps
+#   I will do this a lot so making a function to not repeat code
+#   will not parameterize things like textNA, data title because the function
+#   is designed for a single data source that I know
+get_sst_map <- function(data, title, palette='-Spectral', style='cont',  # set default parameters
+                        palette_mid=15, 
+                        scale_breaks=c(0, 2500, 5000, 7500, 10000),
+                        colourblind=FALSE) {
+  
+  # use colour-blind (deuterantopia, protanopia, tritanonia) friendly palette
+  #   if the user inputs it. this is extremely important when mapping with a
+  #   high range colour scheme. this could just be done with the palette parameter,
+  #   but I think its nice to not make a colourblind person have to go through
+  #   colour palettes themselves
+  if (colourblind) {
+    palette <- 'BrBG'
+  }
+  
+  # create map
+  map <- tm_shape(data) +  # shape around input data
+    # we know the input will be of raster type, so plot with raster
+    #   use parameter values where it might change
+    tm_raster(palette=palette, midpoint=palette_mid, colorNA='gray', textNA='Land',
+              breaks=sst_val_brks, title='SST (\u00B0C)', style=style) +
+    # adjust map. set legend position, title and sizing
+    tm_layout(legend.outside.position=c('right'),
+                legend.outside.size=0.2,
+                legend.outside=TRUE,
+                legend.title.size=1,
+                main.title=title,
+                main.title.size=1,
+                panel.label.size=0.05,
+                legend.width=1) +
+    tm_scale_bar(position=c(0.01, 0), breaks=scale_breaks) +
+    tm_compass(size=0.8, text.size=0.8, position=c(0.93, 0.03)) # add scale bar 
+  
+  return(map)  # return map object
+}
+
+# save map at 01/01/1854
+sst_185401 <- get_sst_map(sst_rast$X1854.01.01, 'SST at 01/01/1854',
+                          style='pretty')  # use pretty (classified) style
+
+# save map at 01/01/2019
+sst_201901 <- get_sst_map(sst_rast$X2019.01.01, 'SST at 01/01/2019',
+                          style='pretty')  # use pretty (classified) style
+
+# plot both maps side-by-side
+tmap_arrange(sst_185401, sst_201901, ncol=1, asp=2)
+```
+
+The temperature looks to be increasing, but that is only 2 time points out of a total of 1994. I thought I would visualise all data by creating an animation of SST over time, with each frame in the animation being a plot at a given time point.
+
+```{r 6_sstanimation}
+# I found that the animation functions (eg. gganimate) could not really handle
+#   1994 unique visualisations. So I output each plot as a frame that I then
+#   convert to a video. This requires storage of the rendered frames (images)
+#   of around 250mb, but does mean that all the processing can happen in 
+#   advance and so the visualisation itself is very smooth. The images take 
+#   about 5 minutes to save and the video processing takes about 30 seconds.
+#   I have included the code to create the visualisation here, as well as the
+#   output in the folder in case you want to save time.
+
+# If you want to stitch the images manually in ffmpeg, you can use: 
+#   'cat $(find . -maxdepth 1 -name "*.jpeg" | sort -V) | ffmpeg 
+#     -framerate 15 -i - sst_vis.mp4'
+
+sst_vis_fname <- 'plots/sst_animation.mp4'  # set output file name
+
+# check if the output file exists. if it does exist, begin processing
+if (!file.exists(sst_vis_fname)) {
+  
+  # for each raster in the raster stack
+  for (x in 1:dim(sst_rast)[3]) {
+    # create a frame identifier, in this case the order the raster is in the 
+    #   stack (which is sorted by date). add leading zeros for file sorting
+    frame_id <- str_pad(x, 4, pad = '0') 
+    fname <- paste('vis_frames/', frame_id, '.jpeg', sep='')  # create filename for frame
+  
+    # parse the date of the current frame to use as plot title 
+    #   have to account for the leading 'X' in the raster name
+    map_date <- as_date(names(sst_rast[[x]])[[1]], format='X%Y.%m.%d')
+  
+    # get map using function
+    #   use continuous style to have a smoother representation of the data
+    #   this is important when scrolling through frames in a video
+    cur_map <- get_sst_map(sst_rast[[x]], title=paste(map_date), style='cont')
+  
+    # save map as file, with set size that works for aspect ratio of data
+    tmap_save(cur_map, fname, width=1500, height=800, dpi=200)
+
+  }
+  
+  # obtain list of all frames (all jpeg files in output folder)
+  list_of_frames <- list.files('vis_frames', pattern='*.jpeg', full.names=T)
+  
+  # encode video - stitch all frames together at a frame rate of 20 frames per second
+  av_encode_video(list_of_frames, framerate=20, output=sst_vis_fname)
+  }
+```
+
+![](plots/sst_animation.mp4){width="100%"}
+
+This animation shows us some of the spatial and temporal patterns in the data. We can see strong seasonal variation with temperature oscillating between North and South. If you focus on South America you can even see the reduction in temperature extending West due to El Niño Southern Oscillation. I think I can see bands of higher temperature extending beyond the tropics as time increases, but I am not certain. We can test for this!
+
+First I will get a global average of temperature and see how this changes over time. Since we only have 2 months of data in 2020, I am going to exclude data from this year from here on. The lower data points for this year will skew any averages, so for simplicity I will just remove them.
+
+```{r 7_sstglobalaverages}
+# get all data before 2020 
+sst_df_long <- sst_df_long %>% filter(year < 2020)
+
+# create global average of data, aggregating each month
+sst_globalavg_mth <- sst_df_long %>% 
+  group_by(date_day) %>%  # group by date (date each month)
+  summarise(mean_sst=mean(sst)) %>%  # calculate mean
+  ungroup() %>%  # ungroup
+  mutate(month=month(date_day, label=TRUE))  # get month name for facets
+
+# create global average of data, aggregating each year
+sst_globalavg_yr <- sst_df_long %>%
+  group_by(year) %>%  # group by year
+  summarise(mean_sst=mean(sst)) %>%  # calculate mean
+  ungroup() %>%  # ungroup
+  mutate(year_date=ymd(year, truncated=2L))  # convert date to year as date (first of first month, for plotting)
+
+# plot global averages of sst
+ggplot() +
+  # line for monthly average (x of date, y of sst, save to Month colour group)
+  geom_line(data=sst_globalavg_mth, aes(x=date_day, y=mean_sst, col='Month'))  +
+  # line for yearly average (x of date, y of sst, save to Annual colour group)
+  geom_line(data=sst_globalavg_yr, aes(x=year_date, y=mean_sst, col='Annual')) +
+  # add manual scale colour, setting title to period and colours according to group
+  scale_colour_manual(name='Period', values=c('Annual'='red', 'Month'='black')) +
+  labs(x='Date', y='Mean SST (\u00B0C)', title='Global SST over time') +  # set labels
+  theme_bw() +  # set theme
+  theme(plot.title=element_text(hjust=0.5))  # centre title text
+
+# interactive plot with date slider (monthly average sst over time)
+plot_ly(sst_globalavg_mth, x=~date_day) %>%   # get only average vals
+  add_lines(y=~mean_sst, line=list(color='black')) %>%  # add line plot, y of sst
+  # set layout. change axis labels, title, add date range slider
+  layout(xaxis=list(title='Date', rangeslider=list(type='date')), 
+         yaxis=list(title='Mean SST (\u00B0C)'),
+         title='Global SST over time (monthly)')
+```
+
+Looks like there is a significant increase over time, but with lots of seasonal variation. Let's explore that splitting the data by month.
+
+```{r 8_sstglobalaveragesmonthly}
+# plot global averages of sst, split by month 
+ggplot() +
+  # line for monthly average, (x of date, y of sst)
+  geom_line(data=sst_globalavg_mth, aes(x=date_day, y=mean_sst))  +
+  facet_wrap(~month) +  # split plot by month
+  labs(x='Date', y='Mean SST (\u00B0C)', title='Global SST over time by month') + # set labels
+  theme_bw() +  # set theme
+  theme(plot.title=element_text(hjust=0.5))  # centre title text
+```
+
+All months appear to show an increase in mean SST over time, with a dip in the early 1900s. In the animation it looked like SST varied a lot spatially. So let's plot by the climate zones that we defined earlier (eg. tropical, arctic etc.).
+
+```{r 9_sstzoneaverages}
+# group by climate zones
+sst_yr_zones <- sst_df_long %>% 
+  group_by(zone, year) %>%  # group by climate zone and year 
+  summarise(mean_sst=mean(sst)) %>%   # calculate mean sst
+  ungroup() %>%  # ungroup
+  mutate(year_date=ymd(year, truncated=2L))  # convert date to year as date (first of first month, for plotting)
+
+# plot sst by year, grouped by climate zone
+ggplot(sst_yr_zones, aes(x=year_date, y=mean_sst)) +
+  geom_line() +  # line geometry
+  facet_wrap(~zone, scale='free') +  # group by climate zone, scale freely for appropriate y limits
+  scale_x_date() +  # use date scale for x axis
+  labs(y='Mean SST (\u00B0C)', x='Date', title='SST by climate zone') +  # set labels
+  theme_bw() +  # set theme
+  theme(plot.title=element_text(hjust=0.5))  # centre title text
+```
+
+All climate zones appear to be increase in temperature except for Antarctic, although the small range of this data implies the increase may be insignificant. Let's hone in on this spatial variation by exploring the relationship between latitude/longitude and average SST.
+
+```{r 10_sstbylatlon}
+# calculate sst by x and y coordinates
+sst_by_xy <- sst_df_long %>% 
+  # use only set years to reduce size of data/increase plot legibility
+  filter(year %in% c(1875, 1900, 1925, 1950, 1975, 2000)) %>% 
+  mutate(Latitude=y, Longitude=x) %>%  # convert labels for plotting
+  group_by(Longitude, Latitude, year) %>%  # group by lat, lon and year
+  # convert to long format with lat and lon, so can facet by axis
+  pivot_longer(c(Longitude, Latitude), names_to='axis', values_to='coordinate') %>%
+  ungroup() %>%  # ungroup
+  # group by axis and coordinate
+  #   have to group by twice as it needs to be pivoted before grouping again
+  group_by(axis, coordinate, year) %>%  
+  summarise(sst=mean(sst)) %>%  # calculate mean sst
+  ungroup() %>%  # ungroup
+  mutate(year=as.factor(year))  # convert to factor for categorical plotting
+
+# plot sst over set times, facet by xy axis
+ggplot(sst_by_xy, aes(x=coordinate, y=sst, col=year)) +
+  geom_line() +  # line geometry
+  facet_wrap(~axis, scale='free') +  # group by axis, free scale for appropriate y limits
+  labs(x='Coordinate (degrees)', y='Mean SST (\u00B0C)', 
+       title='SST by latitude/longitude and year') +  # set labels
+  theme_bw() +  # set theme
+  theme(plot.title=element_text(hjust=0.5))  # centre title text
+```
+
+The above plot shows a strong relationship between latitude and SST, matching the previous maps which show the tropics have higher temperatures. Longitude has a weaker relationship, with a dip around 25$^\circ$ and another around 300$^\circ$. Both show that the relationship between latitude/longitude does not appear to change over time, except for slight increases in magnitude overall as time goes on.
+
+Finally, let's look at a specific region before taking a look at the CO$_2$ data. I can crop the raster with a bounding box, save it as a stack then manipulate it in the same way as the entire dataset.
+
+```{r 11_sstoceania}
+# set bounding box coordinates
+# converts to df, then polygon. I have used the original vector then converted 
+#   to df so I can use http://bboxfinder.com and simply copy and paste the 
+#   values into that variable
+bbox <- c(90.351563,-54.367759,190.898438,9.795678)  # vector of coords from http://bboxfinder.com
+bbox_df <- data.frame(x=c(bbox[1], bbox[3]), y=c(bbox[2], bbox[4]))  # extract coords to df
+# convert df to simple feature, then get bounding box of that sf, then convert that to sf
+bbox_poly <- st_as_sfc(st_bbox(st_as_sf(bbox_df, coords=c('x', 'y'), crs=4326)))
+
+sst_rast_oc <- stack(crop(sst_rast, st_as_sf(bbox_poly)))  # crop raster to bbox
+
+# get map of cropped stack in 1854
+# note the changed input parameters to represent the different values of this small extent
+sst_map_oc_1854 <- get_sst_map(sst_rast_oc$X1854.01.01, 'SST in Oceania at 01/01/1854', 
+                          palette_mid=20, scale_breaks=c(0, 1000, 2000, 3000),
+                          style='pretty')
+
+# get map of cropped stack in 2019
+# note the changed input parameters to represent the different values of this small extent
+sst_map_oc_2019 <- get_sst_map(sst_rast_oc$X2019.01.01, 'SST in Oceania at 01/01/2019', 
+                          palette_mid=20, scale_breaks=c(0, 1000, 2000, 3000),
+                          style='pretty')
+
+# plot maps side-by-side. change aspect for bbox
+tmap_arrange(sst_map_oc_1854, sst_map_oc_2019, ncol=1, asp=1.45)
+```
+
+The coarse resolution of the data is more apparent in this zoomed-in map of Oceania. That being said, SST still shows notable variation so I can be reasonably confident that global averages will account for local variation to some extent.
+
+Overall I can conclude that SST has increased since 1854, based on this modelled data. This includes when accounting for seasonal variation through averaging. SST varies spatially, with high temperatures around the tropics and low temperatures near the poles. All climate zones have increased in SST except for the Antarctic, which has decreased slightly. Latitude has a far stronger relationship with temperature than longitude. Despite the coarse resolution, SST clearly varies spatially so we can be confident that the global averages account for spatial variation.
+
+### Carbon Dioxide
+Next we will load up the CO$_2$ dataset. This dataset is not spatial, so the manipulation process is a bit more straightforward.
+
+```{r 12_loadco2}
+# load co2 data. skip header (first 56 rows)
+co2 <- read.csv('data/co2_mm_mlo.csv', skip=56)
+
+head(co2)  # print first few rows of data
+```
+
+The variables I am interested in are CO$_2$ concentration (average), deaseasonalized CO$_2$ concentration (deaseasonalized), and time (decimal.date). We will have to do something with that date to match it up with the SST.
+
+```{r 13_cleanandvisco2}
+# parse dates, convert to long format, drop unused columns
+co2_df <- co2 %>% 
+  mutate(date_day=as_date(date_decimal(co2$decimal.date)),
+         date_month=format(date_day, '%Y-%m')) %>%  # parse dates
+  mutate(avg_co2=average, deseas_avg_co2=deseasonalized) %>%  # rename cols
+  select(year, month, date_day, date_month, avg_co2, deseas_avg_co2) %>%  # select cols I want
+  # pivot by co2 conc measurement type (desasonalized or normal)
+  pivot_longer(cols=c(avg_co2, deseas_avg_co2), names_to='type', values_to='co2_conc') %>%
+  mutate(month_label=month(month, label=TRUE))  # get month name
+
+head(co2_df)  # print first few rows of data
+
+# I chose to use TeX instead of markdown themes for subscript because
+#   markdown themes offer less plot customization, particularly centreing 
+#   plot titles which I really like doing. I have to manually reference it
+#   with latex2exp:: beacuse there is a conflicting function with plotly
+
+# plot co2 over time
+ggplot(co2_df, aes(x=date_day, y=co2_conc, colour=type)) +  # colour by pivoted type
+  geom_line() +  # line geometry
+  scale_x_date(date_labels='%Y', date_breaks='5 years') +  # format x axis to have labels every 5 years
+  labs(x='Date', y=latex2exp::TeX('Average CO$_2$ concentration (ppm)'), colour='Data type', 
+       title=latex2exp::TeX('CO$_2$ concentration over time')) +  # set labels
+  # set colour scale according to type
+  scale_colour_manual(values=c('red', 'black'), labels=c('Average', 'Deaseasonalized average')) +
+  theme_bw() +  # set theme
+  # centre title text, move legend to bottom of plot
+  theme(legend.position='bottom', plot.title=element_text(hjust=0.5))
+
+# interactive plot with date slider (average co2 over time)
+plot_ly(co2_df %>% filter(type == 'avg_co2'), x=~date_day) %>%   # get only average vals
+  add_lines(y=~co2_conc, line=list(color='black')) %>%  # add line plot, y of co2
+  # set layout. change axis labels, title, add date range slider
+  layout(xaxis=list(title='Date', rangeslider=list(type='date')), 
+         yaxis=list(title='Average CO<sub>2</sub> concentration (ppm)'),
+         title='CO<sub>2</sub> concentration over time')
+```
+
+That's a pretty clear trend! Even with seasonal variation, CO$_2$ concentration certainly increases over time. But let's confirm about the seasonal variation to validate their deasonalized trend. 
+
+```{r 14_co2bymonth}
+# plot co2 over time grouped by month
+ggplot(co2_df, aes(x=date_day, y=co2_conc)) +
+  geom_line() +  # line geometry
+  facet_wrap(~month_label) +  # group by month
+  labs(x='Date', y=latex2exp::TeX('Average CO$_2$ concentration (ppm)'),
+       title=latex2exp::TeX('CO$_2$ concentration over time by month')) +  # set labels
+  theme_bw() +  # set theme
+  theme(plot.title=element_text(hjust=0.5))  # centre title text
+```
+
+Looks like the increase is linear across the seasons/months. Let's compare the overall trend to a linear trend.
+
+```{r 15_co2linear}
+# plot co2 with linear trend line
+ggplot(co2_df %>% filter(type == 'avg_co2'), aes(x=date_day, y=co2_conc)) +  # plot average only
+  geom_line() +  # line geometry
+  geom_smooth(type=lm, col='blue') +  # add linear smoother/trend line
+  scale_x_date(date_labels='%Y', date_breaks='5 years') +  # format x axis to have labels every 5 years
+  labs(x='Date', y=latex2exp::TeX('Average CO$_2$ concentration (ppm)'), colour='Data type', 
+       title=latex2exp::TeX('CO$_2$ concentration over time with linear trend (blue)')) +  # set labels
+  # set colour scale according to type (only 1 type here)
+  scale_colour_manual(values=c('black'), labels=c('Average')) +
+  theme_bw() +  # set theme 
+  theme(plot.title=element_text(hjust=0.5))  # centre title text
+
+```
+
+I can conclude that averaged CO$_2$ concentration, as measured (and modelled where necessary) by this dataset, has increased since 1958. This increase follows a linear trend, and has occured in every season.
+
+## Merging data
+Now I will combine the SST and CO$_2$ data so I can explore their relationship. I will remove the spatial component of the SST data as the CO$_2$ data are non-spatial, creating a global average of SST before joining. I could go the other way around - extrapolating the CO$_2$ data to the SST spatial points, but since we only have one spatial location (Hawaii, where the CO$_2$ data were recorded) this would not be very effective.
+
+```{r 16_dateranges}
+range(co2_df$date_month)  # get range of dates in co2 data
+range(sst_df_long$date_month)  # get range of dates in sst data
+```
+
+I will join by date, resulting in a dataset that has CO$_2$ and SST data at each month. The SST data are modelled for the first of each month, while the CO$_2$ data are collected around the middle of each month. For the purposes of this report, I will be using only monthly aggregations, and will essentially ignore day. In the case of the CO$_2$ data are averaged monthly so the day is less important, so I believe removing day from the analyses is an acceptable assumption. Above we can see that SST data range from 01/1854 to 12/2019 (remember I filtered the latter value to max at 2019) while the CO$_2$ data range from 03/1958 to 02/2023. I will take the most data that fit between both ranges, provided each year has a full 12 months of data. We saw with the SST data that we need a full year to get a good average/representation. So my final range will be 01/1959 to 12/2019.
+
+```{r 17_joindata}
+daterange <- interval(ymd('1959-01-01'), ymd('2019-12-31'))  # set date range/interval
+
+# filter co2 by date range
+co2_df_datefilter <- co2_df %>%
+  filter(date_day %within% daterange) %>%
+   # pivot wider so I can pivot longer when data are merged (don't need deaseasonalized anymore)
+  pivot_wider(names_from=type, values_from=co2_conc) 
+
+# filter sst data by date range
+sst_df_datefilter <- sst_globalavg_mth %>%
+  filter(date_day %within% daterange) %>%
+  mutate(date_month=format(date_day, '%Y-%m'), avg_sst=mean_sst)  # consistent names (mean=avg)
+
+# we want wide and long formats because we are going to plot the relationship 
+#   between variables that would not be easy in long format
+
+# create wide format
+#   we want wide format here because we are going to plot the relationship 
+#   between variables that would not be easy in long format
+co2_sst <- co2_df_datefilter %>% 
+  # remove suffix for y data - we are keeping this as the main date as explained above
+  left_join(sst_df_datefilter, by='date_month', suffix=c('.x', '')) %>%  
+  select(year, date_month, month_label, date_day, avg_co2, avg_sst)  # select vars of interest
+
+head(co2_sst)  # display first few rows of wide data
+
+# create long format
+co2_sst_long <- co2_sst %>%
+  # pivot by data type (co2/sst)
+  pivot_longer(cols=c(avg_co2, avg_sst), names_to='data_type', values_to='value')
+  
+head(co2_sst_long)  # display first few rows of long data
+
+```
+
+## Exploring CO$_2$ and SST
+Now we have a merged, cleaned dataset for SST and CO$_2$. Let's explore it!
+
+```{r 18_plotboth}
+# set labels. can't use tex here so used unicode for subscript 2
+co2_sst_labels <- as_labeller(c('avg_co2'='Average CO\u2082 (ppm)', 
+                                'avg_sst'='Average SST (\u00B0C)'))
+# plot co2 and sst over time next to each other
+ggplot(co2_sst_long, aes(x=year, y=value)) +
+  geom_line() +  # line geometry
+  # wrap by data type (co2/sst), scale freely, apply labels
+  facet_wrap(~data_type, scale='free', labeller=co2_sst_labels) + 
+  labs(x='Date', y='Value', title=latex2exp::TeX('Average CO$_2$ and SST over time (annually)')) +  # set labels
+  theme_bw() +  # set theme
+  theme(plot.title=element_text(hjust=0.5))  # centre title text
+
+# plot co2 against sst
+ggplot(co2_sst, aes(x=avg_co2, y=avg_sst)) +
+  geom_line() +  # line geometry
+  geom_smooth(type='lm') +  # add linear trend/smoother
+  labs(x=latex2exp::TeX('Average CO$_2$ (ppm)'), y='Average SST (\u00B0C)',
+       title=latex2exp::TeX('Relationship between monthly CO$_2$ and SST')) +  # set labels
+  theme_bw() +  # set theme 
+  theme(plot.title=element_text(hjust=0.5))  # centre title text
+```
+
+Plotting the two variables together confirms that as CO$_2$ and SST increase over time. When we plot them against one another, removing the time component, we can see that as CO$_2$ increases, so does SST. There is quite a lot of variation between the linear trend, so let's check how this varies by month.
+
+```{r 19_bothbymonth}
+# plot co2 against sst by month
+ggplot(co2_sst, aes(x=avg_co2, y=avg_sst)) +
+  geom_line() +  # line geometry
+  facet_wrap(~month_label) +  # group by month
+  labs(x=latex2exp::TeX('Average CO$_2$ (ppm)'), y='Average SST (\u00B0C)',
+       title=latex2exp::TeX('Relationship between monthly CO$_2$ and SST by month')) +  # set labels
+  theme_bw() +  # set theme
+  theme(plot.title=element_text(hjust=0.5))  # centre title text
+```
+
+Seems to be a pretty consistent upwards trend between the two variables regardless of the month, varying a bit by magnitude of increase. Since we have a linear relationship, we can build a linear model.
+
+```{r 20_monthlymodel}
+ # create linear model of sst and co2 by month
+co2_sst.mod <- lm(avg_sst ~ avg_co2, data=co2_sst) 
+
+summary(co2_sst.mod)  # print model information
+
+autoplot(co2_sst.mod)  # plot model information (residuals)
+```
+
+I am not too confident with this model. While the variables do seem to increase together, I don't think I can claim that one has a strong correlation with the other given the low r$^2$ and high variation in residuals. This may be due to the high seasonal variation in magnitude of values, which we can test for by taking yearly averages instead of monthly.
+
+```{r 21_yearlymodel}
+# create yearly aggregation of sst and co2
+co2_sst_yearly <- co2_sst %>% 
+  group_by(year) %>%  # group by year
+  summarise(avg_sst=mean(avg_sst), avg_co2=mean(avg_co2)) %>%   # get means of sst and co2
+  ungroup()  # ungroup
+
+# plot co2 against sst by year
+ggplot(co2_sst_yearly, aes(x=avg_co2, y=avg_sst)) +
+  geom_line() +  # line geometry
+  geom_smooth(type='lm') +  # add linear smoother/trend
+  labs(x=latex2exp::TeX('Average CO$_2$ (ppm)'), y='Average SST (\u00B0C)',
+       title=latex2exp::TeX('Relationship between yearly CO$_2$ and SST')) +  # set labels
+  theme_bw() +  # set theme
+  theme(plot.title=element_text(hjust=0.5))  # centre plot text
+
+ # create linear model of sst and co2, this time by year
+co2_sst_yearly.mod <- lm(avg_sst ~ avg_co2, data=co2_sst_yearly) 
+
+summary(co2_sst_yearly.mod)  # print model information
+
+autoplot(co2_sst_yearly.mod)  # plot model information (residuals)
+```
+
+That looks a bit better. The r$^2$ is high and the residuals have a non-static trend. There is still significant variation away from the linear trend line as the underlying averages change between years in non-linear ways. I think there is a need for a more complex model that can account for seasonal and sub-seasonal variation. Regardless, we might as well try and predict some values.
+
+```{r 22_comparemodels}
+# create x (co2) values to predict y (sst) values at
+co2_to_predict <- seq(300, 500, by=1)  # 300 to 500 every 1
+
+# create dataframe with x values to then join predicted y values to (yearly)
+co2_sst_yearly.preds <- data.frame(avg_co2=co2_to_predict)  
+# create predictions based on yearly model
+co2_sst_yearly.preds$avg_sst <- predict(object=co2_sst_yearly.mod, newdata=co2_sst_yearly.preds)
+
+# create dataframe with x values to then join predicted y values to (monthly)
+co2_sst.preds <- data.frame(avg_co2=co2_to_predict)
+# create predictions based on monthly model
+co2_sst.preds$avg_sst <- predict(object=co2_sst.mod, newdata=co2_sst.preds)
+
+# plot both model predictions with background yearly data
+#   (choosing yearly as background because it is easier to plot)
+ggplot(co2_sst_yearly, aes(x=avg_co2, y=avg_sst, col='data')) +
+  geom_line() +  # line geometry
+  # plot yearly predictions as line, save in its own group
+  geom_line(data=co2_sst_yearly.preds, aes(x=avg_co2, y=avg_sst, col='pred_yr')) +
+  # plot monthly predictions as line, save in its own group
+  geom_line(data=co2_sst.preds, aes(x=avg_co2, y=avg_sst, col='pred_mt')) +
+  # set labels
+  labs(x=latex2exp::TeX('Average CO$_2$ (ppm)'), y='Average SST (\u00B0C)',
+       title=latex2exp::TeX('Relationship between yearly CO$_2$ and SST with predictions')) +
+  theme_bw() +  # set theme
+  theme(plot.title=element_text(hjust=0.5))  +  # centre title text
+  # set colours manually based on group
+  scale_colour_manual(name='Trend', 
+                      values=c('pred_yr'='red', 'data'='black', 'pred_mt'='blue'), 
+                      labels=c('pred_yr'='Predictions (yearly model)', 'data'='Data', 
+                               'pred_mt'='Predictions (monthly model)'))
+```
+
+The plot above shows that the monthly and yearly models did not have much of a trend change. The r$^2$ was higher because less seasonal variation (and less data in general) was behind the model, so while the trend was the same the calculated relationship was stronger to the source data - I do not think this is a much better model as a result. Overall, the linear model does show the overall trend of increase, but monthly and yearly fluctuations in the relationship between CO$_2$ and SST are not accounted for. As such, I would use the model for rough estimations of SST based on CO$_2$ values, but would consider a large margin of error.
+
+## Conclusion
+Overall I think there is a correlation between CO$_2$ and SST, showing that as carbon dioxide increases so will sea surface temperature. This is a problem as carbon emissions are slowing but not stopping, and I am sure we are yet to see the latent effect of CO$_2$ rise on SST. I have shown how an emissions and climate indicator can be explored independently and together pretty easily. Global climate models are complicated and not very accessible as a result. But their data, such as the SST used in this model, can be loaded up with a few lines of code which is important to build on our understanding of the climate system and our trust of these models. Measured emissions data is more straightforward, but it can still be very important to look at raw data yourself to validate the headlines you see in the news! This code is an example of how you can that.
+
+That being said, my analysis has some flaws. Comparing a spatial dataset to a non-spatial dataset can be problematic, and I think we need a spatial distribution of CO$_2$ in order to confirm the trend seen in this data. I found that applying a simple linear model seasonal data was not very effective, although it does give a baseline with which we can make some conclusions, albiet with a high margin of error in the exact value.
+
+R was a super effective tool at manipulating and visualising these datasets. I would like to see a few more simple options for reprojecting and visualising rasters with webmaps as this was tricky in practice. Despite that, I was able to show how SST varied spatially and seasonally, and how CO$_2$ varied spatially. I then merged them both to see how they correlated. 
+
+In theory much of this code could be repurposed to look at any netcdf climate file as they often have 2$^\circ$ regular grids. Have a go yourself!
+
+## References
+Fawzy, S., Osman, A. I., Doran, J., & Rooney, D. W. (2020). Strategies for mitigation of climate change: a review. Environmental Chemistry Letters, 18, 2069-2094.
+
+Huang, B., Thorne, P. W., Banzon, V. F., Boyer, T., Chepurin, G., Lawrimore, J. H., ... & Zhang, H. M. (2017). NOAA extended reconstructed sea surface temperature (ERSST), version 5. NOAA National Centers for Environmental Information, 30(8179-8205), 25.
+
+Keeling, C. D., Piper, S. C., Bacastow, R. B., Wahlen, M., Whorf, T. P., Heimann, M., & Meijer, H. A. (2001). Exchanges of atmospheric CO2 and 13CO2 with the terrestrial biosphere and oceans from 1978 to 2000. I. Global aspects.
+
+Masson-Delmotte, V., Zhai, P., Pirani, A., Connors, S. L., Péan, C., Berger, S., … & Zhou, B. (2021). Climate change 2021: the physical science basis. Contribution of working group I to the sixth assessment report of the intergovernmental panel on climate change, 2.
+
+Pörtner, H. O., Roberts, D. C., Poloczanska, E. S., Mintenbeck, K., Tignor, M., Alegría, A., … & Okem, A. (2022). IPCC, 2022: Summary for policymakers.
